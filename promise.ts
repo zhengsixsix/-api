@@ -1,4 +1,3 @@
-// promise 的实现
 // 首先将三种状态提出来，用枚举管理
 enum State {
   PENDING = "pending",
@@ -17,6 +16,9 @@ type onRejected<TResult2> =
   | ((reason: any) => TResult2 | PromiseLike<TResult2>)
   | undefined
   | null;
+type Executor<T> = (resolve?: Resolve<T>, reject?: Reject) => void;
+
+type onFinally = (() => void) | undefined | null;
 
 const isFunction = (value: any): value is Function =>
   typeof value === "function";
@@ -32,7 +34,7 @@ class SelfPromise<T> {
   // 失败之后的原因
   reason!: T;
 
-  constructor(executor) {
+  constructor(executor: Executor<T>) {
     try {
       executor(this.resolve, this.reject);
     } catch (error) {
@@ -97,7 +99,6 @@ class SelfPromise<T> {
             // 如果返回的也是一个promise 就递归一下
             if (
               this.value &&
-              onFulfilled != null &&
               typeof (this.value as unknown as PromiseLike<T>).then ===
                 "function"
             ) {
@@ -112,11 +113,11 @@ class SelfPromise<T> {
                 const v = onFulfilled?.(this.value)!;
                 resolvePromise(promise2, v, resolve, reject);
               } catch (error) {
-                reject(error);
+                reject?.(error);
               }
             }
           } catch (error) {
-            reject(error);
+            reject?.(error);
           }
         });
       };
@@ -143,11 +144,176 @@ class SelfPromise<T> {
     // 返回一个promise对象
     return promise2;
   };
+
+  static resolve = <T>(value?: T | PromiseLike<T>): SelfPromise<T> => {
+    // 如果这个值是一个 promise ，那么将返回这个 promise
+    if (value instanceof SelfPromise) {
+      return value;
+    }
+    return new SelfPromise((resolve) => this.resolve?.(resolve));
+  };
+
+  static reject = <T = never>(reason?: any): SelfPromise<T> => {
+    return new SelfPromise((resolve, reject) => {
+      reject?.(reason);
+    });
+  };
+
+  //catch 方法等同于 then(null, onRejected) 或 then(undefined, onRejected)
+  public catch = <TResult = never>(
+    onrejected?: onRejected<TResult>
+  ): SelfPromise<T | TResult> => {
+    return this.then(null, onrejected);
+  };
+
+  /**
+   * Promise.prototype.finally()
+   * @param {*} onfinally 无论结果是fulfilled或者是rejected，都会执行的回调函数
+   * @returns
+   */
+  // 无论如何都会执行，不会传值给回调函数
+  public finally = (onfinally?: onFinally): SelfPromise<T> => {
+    return this.then(
+      (value) =>
+        SelfPromise.resolve(
+          isFunction(onfinally) ? onfinally() : onfinally
+        ).then(() => {
+          return value;
+        }),
+      (reason) =>
+        SelfPromise.resolve(
+          isFunction(onfinally) ? onfinally() : onfinally
+        ).then(() => {
+          throw reason;
+        })
+    );
+  };
+
+  /**
+   * Promise.all()
+   * @param {iterable} promises 一个promise的iterable类型（注：Array，Map，Set都属于ES6的iterable类型）的输入
+   * @returns
+   */
+  static all = <T>(promises: readonly T[]): SelfPromise<T[]> => {
+    return new SelfPromise((resolve, reject) => {
+      if (Array.isArray(promises)) {
+        let result: T[] = [];
+        let count = 0;
+        if (promises.length === 0) {
+          return resolve?.(promises);
+        }
+        promises.forEach((item, index) => {
+          // MyPromise.resolve方法中已经判断了参数是否为promise与thenable对象，所以无需在该方法中再次判断
+          SelfPromise.resolve(item).then(
+            (value) => {
+              count++;
+              // 每个promise执行的结果存储在result中
+              result[index] = value;
+              // Promise.all 等待所有都完成（或第一个失败）
+              if (count === promises.length) {
+                resolve?.(result);
+              }
+            },
+            (reason) => {
+              /**
+               * 如果传入的 promise 中有一个失败（rejected），
+               * Promise.all 异步地将失败的那个结果给失败状态的回调函数，而不管其它 promise 是否完成
+               */
+              reject?.(reason);
+            }
+          );
+        });
+      } else {
+        return reject?.(new TypeError("Argument is not iterable"));
+      }
+    });
+  };
+
+  static race = <T>(promises: readonly T[]): SelfPromise<T[]> => {
+    return new SelfPromise((resolve, reject) => {
+      if (Array.isArray(promises)) {
+        // 如果传入的迭代promises是空的，则返回的 promise 将永远等待。
+        if (promises.length) {
+          promises.forEach((item) => {
+            /**
+             * 如果迭代包含一个或多个非承诺值和/或已解决/拒绝的承诺，
+             * 则 Promise.race 将解析为迭代中找到的第一个值。
+             */
+            SelfPromise.resolve(item).then(resolve, reject);
+          });
+        }
+      } else {
+        return reject?.(new TypeError("Argument is not iterable"));
+      }
+    });
+  };
+
+  static allSettled = <T>(
+    promises: readonly T[]
+  ): SelfPromise<PromiseSettledResult<Awaited<T>>[]> => {
+    return new SelfPromise((resolve, reject) => {
+      if (Array.isArray(promises)) {
+        let result: any[] = []; // 存储结果
+        let count = 0; // 计数器
+        if (promises.length === 0) return resolve?.(promises);
+        promises.forEach((item, index) => {
+          SelfPromise.resolve(item).then(
+            (value) => {
+              count++;
+              result[index] = { status: "fulfilled", value };
+              if (count === promises.length) {
+                resolve?.(result);
+              }
+            },
+            (reason) => {
+              count++;
+              result[index] = { status: "rejected", reason };
+              if (count === promises.length) {
+                resolve?.(result);
+              }
+            }
+          );
+        });
+      } else {
+        return reject?.(new TypeError("Argument is not iterable"));
+      }
+    });
+  };
+
+  static any = <T>(promises: readonly T[]): SelfPromise<T[]> => {
+    return new SelfPromise((resolve, reject) => {
+      if (Array.isArray(promises)) {
+        let errors: any[] = []; //
+        let count = 0; // 计数器
+        if (promises.length === 0) {
+          return reject?.(new Error("All promises were rejected"));
+        }
+        promises.forEach((item, index) => {
+          SelfPromise.resolve(item).then(
+            (value) => {
+              // 只要其中的一个 promise 成功，就返回那个已经成功的 promise
+              resolve?.(value);
+            },
+            (reason) => {
+              count++;
+              errors.push(reason);
+              /**
+               * 如果可迭代对象中没有一个 promise 成功，就返回一个失败的 promise 和 AggregateError 类型的实例，
+               * AggregateError是 Error 的一个子类，用于把单一的错误集合在一起。
+               */
+              if (count === promises.length) {
+                reject?.(new Error("All promises were rejected"));
+              }
+            }
+          );
+        });
+      } else {
+        reject?.(new TypeError("Argument is not iterable"));
+      }
+    });
+  };
 }
-export default SelfPromise
-
-
-
+export default SelfPromise;
 
 const resolvePromise = <T>(
   promise2: SelfPromise<T> | null,
